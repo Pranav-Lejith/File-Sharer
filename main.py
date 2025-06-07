@@ -339,6 +339,3 @@ if st.session_state.show_main_content:
 # Show Command Prompt if activated
 if st.session_state.show_command_prompt:
     command_prompt()
-
-if __name__ == "__main__":
-    create_ui()
