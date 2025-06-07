@@ -1,0 +1,6 @@
+streamlit
+humanize
+requests
+extra-streamlit-components
+streamlit-extras
+streamlit-modal
