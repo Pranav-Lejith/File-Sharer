@@ -1,456 +1,344 @@
 import streamlit as st
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import socketserver
 import os
-import threading
-from datetime import datetime
-import shutil
-import requests
-from pathlib import Path
+import base64
+import hashlib
+import json
 import time
-import humanize
-from urllib.parse import quote, unquote
-import logging
-from streamlit_extras.colored_header import colored_header
-from streamlit_modal import Modal
-import extra_streamlit_components as stx
+import zipfile
+import io
+import shutil
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Set page config for a wider layout and dark theme
+st.set_page_config(layout="wide", page_title="File Sharer", page_icon="🚀")
 
-# Initialize session state variables
-if 'server_running' not in st.session_state:
-    st.session_state.server_running = False
-if 'transfer_history' not in st.session_state:
-    st.session_state.transfer_history = []
-if 'public_ip' not in st.session_state:
-    try:
-        st.session_state.public_ip = requests.get("https://api.ipify.org").text
-    except Exception as e:
-        st.session_state.public_ip = "Unable to fetch IP"
+# Custom CSS for futuristic look
+st.markdown("""
+<style>
+    .stApp {
+        background: linear-gradient(45deg, #1e1e1e, #2d2d2d);
+        color: #e0e0e0;
+    }
+    .stButton>button {
+        background-color: #00a86b;
+        color: white;
+        border-radius: 20px;
+        border: none;
+        padding: 10px 24px;
+        transition: all 0.3s ease;
+    }
+    .stButton>button:hover {
+        background-color: #008f5b;
+        transform: scale(1.05);
+    }
+    .file-info {
+        background-color: rgba(255,255,255,0.1);
+        border-radius: 10px;
+        padding: 10px;
+        margin-bottom: 10px;
+        transition: all 0.3s ease;
+    }
+    .file-info:hover {
+        background-color: rgba(255,255,255,0.2);
+        transform: translateY(-5px);
+    }
+    .download-button, .delete-button {
+        display: inline-block;
+        color: white !important;
+        text-decoration: none;
+        padding: 8px 16px;
+        border-radius: 20px;
+        transition: all 0.3s ease;
+        text-align: center;
+        margin: 5px 0;
+    }
+    .download-button {
+        background-color: #00a86b;
+    }
+    .download-button:hover {
+        background-color: #008f5b;
+        transform: scale(1.05);
+        text-decoration: none;
+    }
+    .delete-button {
+        background-color: #ff4757;
+    }
+    .delete-button:hover {
+        background-color: #ff6b81;
+        transform: scale(1.05);
+        box-shadow: 0 0 15px #ff4757;
+    }
+    @keyframes glow {
+        0% { box-shadow: 0 0 5px #00a86b; }
+        50% { box-shadow: 0 0 20px #00a86b; }
+        100% { box-shadow: 0 0 5px #00a86b; }
+    }
+    .glow-effect {
+        animation: glow 2s infinite;
+    }
+    .command-prompt {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        z-index: 1000;
+    }
+    .command-prompt-window {
+        position: fixed;
+        bottom: 80px;
+        right: 20px;
+        width: 400px;
+        background-color: #000000;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 0 20px rgba(255,0,0,0.5);
+        z-index: 1000;
+    }
+    .close-button {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        cursor: pointer;
+        color: #ff0000;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# styling with custom CSS
-def load_custom_css():
+def create_splash_html(text, color):
+    return f"""
+    <style>
+    .typewriter h1 {{
+      overflow: hidden;
+      color: {color};
+      white-space: nowrap;
+      margin: 0 auto;
+      letter-spacing: .15em;
+      border-right: .15em solid orange;
+      animation: typing 3.5s steps(30, end), blink-caret .5s step-end infinite;
+    }}
+
+    @keyframes typing {{
+      from {{ width: 0 }}
+      to {{ width: 100% }}
+    }}
+
+    @keyframes blink-caret {{
+      from, to {{ border-color: transparent }}
+      50% {{ border-color: orange }}
+    }}
+    </style>
+    <div class="typewriter">
+        <h1>{text}</h1>
+    </div>
+    """
+
+# Set the upload directory
+UPLOAD_DIR = "uploaded_files"
+METADATA_FILE = "file_metadata.json"
+
+# Create the upload directory if it doesn't exist
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+# Load or create metadata
+if os.path.exists(METADATA_FILE):
+    with open(METADATA_FILE, 'r') as f:
+        file_metadata = json.load(f)
+else:
+    file_metadata = {}
+
+def save_file(uploaded_file, password):
+    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    
+    # Save metadata
+    file_metadata[uploaded_file.name] = {
+        'password': hashlib.sha256(password.encode()).hexdigest() if password else None
+    }
+    with open(METADATA_FILE, 'w') as f:
+        json.dump(file_metadata, f)
+
+def get_file_download_link(file_path, filename):
+    with open(file_path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    return f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}" class="download-button glow-effect">Download {filename}</a>'
+
+def delete_file(filename):
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        if filename in file_metadata:
+            del file_metadata[filename]
+            with open(METADATA_FILE, 'w') as f:
+                json.dump(file_metadata, f)
+        return True
+    return False
+
+def save_folder(uploaded_files, folder_name):
+    folder_path = os.path.join(UPLOAD_DIR, folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+    
+    for uploaded_file in uploaded_files:
+        file_path = os.path.join(folder_path, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+def get_folder_download_link(folder_path, folder_name):
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, 'w') as zf:
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                zf.write(file_path, os.path.relpath(file_path, folder_path))
+    memory_file.seek(0)
+    b64 = base64.b64encode(memory_file.getvalue()).decode()
+    return f'<a href="data:application/zip;base64,{b64}" download="{folder_name}.zip" class="download-button glow-effect">Download {folder_name}</a>'
+
+def download_all_files():
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, 'w') as zf:
+        for root, dirs, files in os.walk(UPLOAD_DIR):
+            for file in files:
+                file_path = os.path.join(root, file)
+                zf.write(file_path, os.path.relpath(file_path, UPLOAD_DIR))
+    memory_file.seek(0)
+    b64 = base64.b64encode(memory_file.getvalue()).decode()
+    st.markdown(f'<a href="data:application/zip;base64,{b64}" download="all_files.zip" class="download-button glow-effect">Download All Files</a>', unsafe_allow_html=True)
+
+# Initialize session state
+if 'show_main_content' not in st.session_state:
+    st.session_state.show_main_content = False
+if 'show_command_prompt' not in st.session_state:
+    st.session_state.show_command_prompt = False
+if 'is_developer' not in st.session_state:
+    st.session_state.is_developer = False
+if 'splash_shown' not in st.session_state:
+    st.session_state.splash_shown = False
+
+# Splash screen
+if not st.session_state.splash_shown:
+    splash = st.empty()
+    splash.markdown(create_splash_html("File Sharer", '#48CFCB'), unsafe_allow_html=True)
+    time.sleep(4)  # Display splash for 4 seconds
+    st.session_state.splash_shown = True
+    st.session_state.show_main_content = True
+    splash.empty()
+
+# Command Prompt
+def command_prompt():
     st.markdown("""
-        <style>
-        .main {
-            padding: 2rem;
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 2rem;
-            margin-bottom: 2rem;
-        }
-
-        .stTabs [data-baseweb="tab"] {
-            height: 50px;
-            padding: 0 24px;
-            background-color: #f8f9fa;
-            border-radius: 8px;
-            font-weight: 500;
-            transition: all 0.3s ease;
-        }
-
-        .stTabs [data-baseweb="tab"]:hover {
-            background-color: #e9ecef;
-        }
-
-        .stTabs [aria-selected="true"] {
-            background-color: #2962ff !important;
-            color: white !important;
-        }
-
-        /* Custom tab colors */
-        .stTabs [data-baseweb="tab"]:nth-child(2) {
-            background-color: #28a745 !important;
-            color: white !important;
-        }
-
-        .stTabs [data-baseweb="tab"]:nth-child(2):hover {
-            background-color: #218838 !important;
-        }
-
-        .stTabs [data-baseweb="tab"]:nth-child(3) {
-            background-color: #ff9800 !important;
-            color: white !important;
-        }
-
-        .stTabs [data-baseweb="tab"]:nth-child(3):hover {
-            background-color: #fb8c00 !important;
-        }
-
-        .custom-button {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.75rem 1.5rem;
-            background-color: #2962ff;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        }
-
-        .custom-button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-
-        .custom-button.danger {
-            background-color: #dc3545;
-        }
-
-        .file-box {
-            background-color: #ffffff;
-            padding: 1.5rem;
-            border-radius: 12px;
-            margin-bottom: 1rem;
-            border: 1px solid #e9ecef;
-            transition: all 0.2s ease;
-        }
-
-        .file-box:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-
-        .status-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.25rem 0.75rem;
-            border-radius: 999px;
-            font-size: 0.875rem;
-            font-weight: 500;
-        }
-
-        .status-success {
-            background-color: #28a74520;
-            color: #28a745;
-        }
-
-        .status-failed {
-            background-color: #dc354520;
-            color: #dc3545;
-        }
-
-        .server-status {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            border-radius: 8px;
-            margin-bottom: 1rem;
-        }
-
-        .server-status.running {
-            background-color: #28a74520;
-            color: #28a745;
-        }
-
-        .server-status.stopped {
-            background-color: #dc354520;
-            color: #dc3545;
-        }
-        </style>
+    <div class="command-prompt-window">
+        <div class="close-button" onclick="document.querySelector('.command-prompt-window').style.display='none';">X</div>
+        <h3 style="color: #ff0000;">Command Prompt</h3>
+        <div id="command-output" style="color: #ff0000; margin-bottom: 10px;"></div>
+        <input type="text" id="command-input" placeholder=">>>" style="width: 100%; background-color: #000000; color: #ff0000; border: 1px solid #ff0000;">
+    </div>
     """, unsafe_allow_html=True)
 
+    command = st.text_input("", key="command_input", label_visibility="collapsed")
+    
+    if command:
+        if command in ['override protocol-amphibiar', 'override command-amphibiar', 
+                       'command override-amphibiar', 'command override-amphibiar23', 
+                       'control override-amphibiar', 'system override-amphibiar', 'user:amphibiar']:
+            st.session_state.is_developer = True
+            st.markdown(create_splash_html("Welcome Developer", '#FF6B6B'), unsafe_allow_html=True)
+            time.sleep(2)
+            st.session_state.show_command_prompt = False
+            st.rerun()
+        elif command.lower() == 'downloadall':
+            download_all_files()
+            st.success("All files have been prepared for download.")
+            st.rerun()
+        elif command.lower() == 'exit dev mode':
+            st.session_state.is_developer = False
+            st.success("Exited developer mode.")
+            st.rerun()
+        else:
+            st.error("Invalid command")
 
-def save_transfer_history(action, filename, status, url=""):
-    st.session_state.transfer_history.append({
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'action': action,
-        'filename': filename,
-        'status': status,
-        'url': url
-    })
+# Main content
+if st.session_state.show_main_content:
+    # App layout
+    st.title("🚀 :red[File Sharer] (:blue[Created By: :red[Amphibiar ]])")
 
+    # File/Folder upload section
+    upload_type = st.radio("Upload type", ("File", "Folder"))
+    
+    if upload_type == "File":
+        uploaded_file = st.file_uploader("Choose a file to upload", type=None)
+        if uploaded_file is not None:
+            st.write(f"Uploaded: {uploaded_file.name}")
+            password = st.text_input("Set a password for this file (optional)", type="password")
+            if st.button("Upload File", key="upload"):
+                save_file(uploaded_file, password)
+                st.success("File uploaded successfully!")
+                st.balloons()
+    else:
+        uploaded_files = st.file_uploader("Choose files to upload", type=None, accept_multiple_files=True)
+        if uploaded_files:
+            folder_name = st.text_input("Enter folder name")
+            if st.button("Upload Folder", key="upload_folder"):
+                save_folder(uploaded_files, folder_name)
+                st.success(f"Folder '{folder_name}' uploaded successfully!")
+                st.balloons()
 
-def clear_transfer_history():
-    st.session_state.transfer_history = []
+    # Display uploaded files and folders
+    st.header("📁 Uploaded Files and Folders")
+    uploaded_items = os.listdir(UPLOAD_DIR)
 
-
-def delete_file(filepath):
-    try:
-        os.remove(filepath)
-        save_transfer_history("delete", filepath.name, "success")
-        return True
-    except Exception as e:
-        logger.error(f"Error deleting file: {str(e)}")
-        save_transfer_history("delete", filepath.name, "failed")
-        return False
-
-
-class SimpleFileHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        try:
-            if self.path == '/':
-                self.send_response(200)
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-
-                html = """
-                <html>
-                <body style="font-family: Arial, sans-serif; padding: 20px;">
-                    <h2>Upload File</h2>
-                    <form action="/upload" method="POST" enctype="multipart/form-data">
-                        <input type="file" name="file" style="margin: 10px 0;">
-                        <input type="submit" value="Upload" style="padding: 5px 15px; background-color: #2962ff; color: white; border: none; border-radius: 4px; cursor: pointer;">
-                    </form>
-                </body>
-                </html>
-                """
-                self.wfile.write(html.encode())
-
-            elif self.path.startswith('/downloads/'):
-                filename = unquote(self.path[10:])
-                filepath = os.path.join('downloads', filename)
-
-                if os.path.exists(filepath):
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/octet-stream')
-                    self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-                    self.end_headers()
-
-                    with open(filepath, 'rb') as file:
-                        shutil.copyfileobj(file, self.wfile)
+    if uploaded_items:
+        for item in uploaded_items:
+            item_path = os.path.join(UPLOAD_DIR, item)
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col1:
+                st.markdown(f"<div class='file-info'>{'📁' if os.path.isdir(item_path) else '📄'} {item}</div>", unsafe_allow_html=True)
+            with col2:
+                if os.path.isdir(item_path):
+                    st.markdown(get_folder_download_link(item_path, item), unsafe_allow_html=True)
                 else:
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(b'File not found')
-
-        except Exception as e:
-            logger.error(f"Error in GET handler: {str(e)}")
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b'Internal server error')
-
-    def do_POST(self):
-        try:
-            if self.path == '/upload':
-                content_type = self.headers['Content-Type']
-                if not content_type or not content_type.startswith('multipart/form-data'):
-                    self.send_response(400)
-                    self.end_headers()
-                    return
-
-                content_length = int(self.headers['Content-Length'])
-                file_data = self.rfile.read(content_length)
-
-                filename = f"uploaded_file_{int(time.time())}"
-                filepath = os.path.join('downloads', filename)
-
-                with open(filepath, 'wb') as f:
-                    f.write(file_data)
-
-                self.send_response(200)
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-                self.wfile.write(b'File uploaded successfully')
-
-        except Exception as e:
-            logger.error(f"Error in POST handler: {str(e)}")
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b'Internal server error')
-
-
-class FileTransferApp:
-    def __init__(self, port=8000):
-        self.port = port
-        self.server = None
-        self.server_thread = None
-        os.makedirs('downloads', exist_ok=True)
-
-    def start_server(self):
-        try:
-            handler = SimpleFileHandler
-            self.server = socketserver.TCPServer(("0.0.0.0", self.port), handler)
-            logger.info(f"Server started on port {self.port}")
-            self.server.serve_forever()
-        except Exception as e:
-            logger.error(f"Server error: {str(e)}")
-
-    def stop_server(self):
-        if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-            logger.info("Server stopped")
-
-
-def create_ui():
-    st.set_page_config(
-        page_title="File Transfer",
-        page_icon="🔄",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-
-    load_custom_css()
-
-    if 'app' not in st.session_state:
-        st.session_state.app = FileTransferApp()
-
-    colored_header(
-        label="File Transfer",
-        description="Secure and easy file sharing",
-        color_name="blue-70"
-    )
-
-    with st.sidebar:
-        st.markdown("### ⚙️ Server Settings")
-        st.markdown(f"**🌐 Your Public IP:**  `{st.session_state.public_ip}`")
-        status_class = "running" if st.session_state.server_running else "stopped"
-        status_icon = "🟢" if st.session_state.server_running else "🔴"
-        st.markdown(
-            f"""<div class="server-status {status_class}">
-                {status_icon} Server {status_class.title()}
-            </div>""",
-            unsafe_allow_html=True
-        )
-        port = st.number_input("Port Number", value=8000, min_value=1024, max_value=65535)
-
-        if not st.session_state.server_running:
-            if st.button("🚀 Start Server", key="start_server", type="primary"):
-                try:
-                    st.session_state.app = FileTransferApp(port=port)
-                    st.session_state.server_thread = threading.Thread(
-                        target=st.session_state.app.start_server,
-                        daemon=True
-                    )
-                    st.session_state.server_thread.start()
-                    st.session_state.server_running = True
-                    st.success("✅ Server started successfully!")
-                except Exception as e:
-                    st.error(f"❌ Failed to start server: {str(e)}")
-        else:
-            if st.button("⏹️ Stop Server", key="stop_server", type="secondary"):
-                try:
-                    st.session_state.app.stop_server()
-                    st.session_state.server_running = False
-                    st.warning("Server stopped!")
-                except Exception as e:
-                    st.error(f"Failed to stop server: {str(e)}")
-        st.sidebar.info("Created By Amphibiar(Pranav Lejith)")
-
-    tab1, tab2, tab3 = st.tabs([
-        "📤 Send Files",
-        "📥 Receive Files",
-        "📋 Transfer History"
-    ])
-
-    with tab1:
-        st.markdown("### 📤 Send Files")
-        receiver_url = st.text_input("🌐 Receiver's URL", placeholder="http://192.168.1.100:8000")
-        uploaded_file = st.file_uploader("📎 Choose file to send", type=None)
-
-        if uploaded_file and receiver_url:
-            if st.button("📤 Send File", key="send_file", type="primary"):
-                with st.spinner("📡 Sending file..."):
-                    try:
-                        files = {'file': uploaded_file.getvalue()}
-                        response = requests.post(f"{receiver_url}/upload", files=files)
-
-                        if response.status_code == 200:
-                            st.success("✅ File sent successfully!")
-                            save_transfer_history("send", uploaded_file.name, "success", receiver_url)
+                    if file_metadata.get(item, {}).get('password'):
+                        password_attempt = st.text_input(f"Password for {item}", type="password", key=f"pwd_{item}")
+                        if st.button("Download", key=f"btn_{item}"):
+                            if hashlib.sha256(password_attempt.encode()).hexdigest() == file_metadata[item]['password']:
+                                st.markdown(get_file_download_link(item_path, item), unsafe_allow_html=True)
+                            else:
+                                st.error("Incorrect password!")
+                    else:
+                        st.markdown(get_file_download_link(item_path, item), unsafe_allow_html=True)
+            with col3:
+                if st.session_state.is_developer:
+                    if st.button("🗑️ Delete", key=f"del_{item}", help=f"Delete {item}"):
+                        if os.path.isdir(item_path):
+                            shutil.rmtree(item_path)
                         else:
-                            st.error(f"❌ Failed to send file: {response.text}")
-                            save_transfer_history("send", uploaded_file.name, "failed", receiver_url)
-                    except Exception as e:
-                        st.error(f"❌ Error sending file: {str(e)}")
-                        save_transfer_history("send", uploaded_file.name, "failed", receiver_url)
+                            delete_file(item)
+                        st.success(f"{item} has been deleted.")
+                        st.rerun()
 
-    with tab2:
-        st.markdown("### 📥 Receive Files")
+    else:
+        st.info("No files or folders uploaded yet.")
 
-        if not st.session_state.server_running:
-            st.warning("⚠️ Server is not running. Start the server to receive files.")
-        else:
-            st.success("✅ Server is running and ready to receive files!")
+    # Password information dropdown
+    with st.expander("🔐 Password Information"):
+        st.write("Files with passwords:")
+        for file, metadata in file_metadata.items():
+            if metadata.get('password'):
+                st.write(f"- {file}")
 
-            st.markdown("#### 📚 Received Files")
-            received_files = sorted(
-                Path("downloads").glob("*"),
-                key=lambda x: x.stat().st_mtime,
-                reverse=True
-            )
+    # Add a note about file persistence
+    st.info("Note: Uploaded files and folders are saved on the server and will be available for all users until the app is restarted or the items are manually deleted.")
 
-            if received_files:
-                for file_path in received_files:
-                    stats = file_path.stat()
-                    with st.container():
-                        st.markdown('<div class="file-box">', unsafe_allow_html=True)
-                        col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
+    # Command Prompt Button
+    st.markdown('<div class="command-prompt">', unsafe_allow_html=True)
+    if st.button("Command Prompt"):
+        st.session_state.show_command_prompt = True
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-                        with col1:
-                            st.markdown(f"📄 **{file_path.name}**")
-                        with col2:
-                            st.text(f"📊 Size: {humanize.naturalsize(stats.st_size)}")
-                        with col3:
-                            with open(file_path, "rb") as f:
-                                st.download_button(
-                                    "⬇️ Download",
-                                    f,
-                                    file_name=file_path.name,
-                                    mime="application/octet-stream",
-                                    key=f"download_{file_path.name}"
-                                )
-                        with col4:
-                            if st.button("🗑️ Delete", key=f"delete_{file_path.name}", type="secondary"):
-                                if delete_file(file_path):
-                                    st.experimental_rerun()
-                        st.markdown('</div>', unsafe_allow_html=True)
-            else:
-                st.info("📭 No files received yet")
-
-    with tab3:
-        st.markdown("### 📋 Transfer History")
-
-        col1, col2 = st.columns([6, 1])
-        with col2:
-            if st.button("🗑️ Clear History", key="clear_history", type="secondary"):
-                clear_transfer_history()
-                st.experimental_rerun()
-
-        if st.session_state.transfer_history:
-            for entry in reversed(st.session_state.transfer_history):
-                with st.container():
-                    st.markdown('<div class="history-box">', unsafe_allow_html=True)
-                    cols = st.columns([2, 2, 2, 2, 3])
-
-                    with cols[0]:
-                        st.markdown(f"🕒 **{entry['timestamp']}**")
-                    with cols[1]:
-                        action_icons = {
-                            "send": "📤",
-                            "receive": "📥",
-                            "delete": "🗑️"
-                        }
-                        st.markdown(f"{action_icons.get(entry['action'], '➡️')} **{entry['action'].title()}**")
-                    with cols[2]:
-                        status_icon = "✅" if entry['status'] == "success" else "❌"
-                        status_class = "status-success" if entry['status'] == "success" else "status-failed"
-                        st.markdown(
-                            f"""<span class="status-badge {status_class}">
-                                {status_icon} {entry['status'].title()}
-                            </span>""",
-                            unsafe_allow_html=True
-                        )
-                    with cols[3]:
-                        st.markdown(f"📄 **{entry['filename']}**")
-                    with cols[4]:
-                        if entry['url']:
-                            st.markdown(f"🌐 `{entry['url']}`")
-                    st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.info("📭 No transfer history available")
-
+# Show Command Prompt if activated
+if st.session_state.show_command_prompt:
+    command_prompt()
 
 if __name__ == "__main__":
     create_ui()
